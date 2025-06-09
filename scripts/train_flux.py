@@ -18,11 +18,11 @@ from diffusers.loaders import AttnProcsLayers
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 import numpy as np
-import flux_grpo.prompts
-import flux_grpo.rewards
-from flux_grpo.stat_tracking import PerPromptStatTracker
-from flux_grpo.diffusers_patch.flux_pipeline_with_logprob import pipeline_with_logprob
-from flux_grpo.diffusers_patch.flux_sde_with_logprob import sde_step_with_logprob
+import flow_grpo.prompts
+import flow_grpo.rewards
+from flow_grpo.stat_tracking import PerPromptStatTracker
+from flow_grpo.diffusers_patch.flux_pipeline_with_logprob import pipeline_with_logprob
+from flow_grpo.diffusers_patch.flux_sde_with_logprob import sde_step_with_logprob
 import torch
 import wandb
 from functools import partial
@@ -34,7 +34,7 @@ from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, PeftMode
 from peft.utils import get_peft_model_state_dict
 import random
 from torch.utils.data import Dataset, DataLoader, Sampler
-from flux_grpo.ema import EMAModuleWrapper
+from flow_grpo.ema import EMAModuleWrapper
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -43,11 +43,92 @@ config_flags.DEFINE_config_file("config", "config/flux_base.py", "Training confi
 
 logger = get_logger(__name__)
 
-def compute_text_embeddings(prompt, text_encoders, tokenizers, max_sequence_length, device):
+class TextPromptDataset(Dataset):
+    def __init__(self, dataset, split='train'):
+        self.file_path = os.path.join(dataset, f'{split}.txt')
+        with open(self.file_path, 'r') as f:
+            self.prompts = [line.strip() for line in f.readlines()]
+        
+    def __len__(self):
+        return len(self.prompts)
+    
+    def __getitem__(self, idx):
+        return {"prompt": self.prompts[idx], "metadata": {}}
+
+    @staticmethod
+    def collate_fn(examples):
+        prompts = [example["prompt"] for example in examples]
+        metadatas = [example["metadata"] for example in examples]
+        return prompts, metadatas
+
+class GenevalPromptDataset(Dataset):
+    def __init__(self, dataset, split='train'):
+        self.file_path = os.path.join(dataset, f'{split}_metadata.jsonl')
+        with open(self.file_path, 'r', encoding='utf-8') as f:
+            self.metadatas = [json.loads(line) for line in f]
+            self.prompts = [item['prompt'] for item in self.metadatas]
+        
+    def __len__(self):
+        return len(self.prompts)
+    
+    def __getitem__(self, idx):
+        return {"prompt": self.prompts[idx], "metadata": self.metadatas[idx]}
+
+    @staticmethod
+    def collate_fn(examples):
+        prompts = [example["prompt"] for example in examples]
+        metadatas = [example["metadata"] for example in examples]
+        return prompts, metadatas
+
+class DistributedKRepeatSampler(Sampler):
+    def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
+        self.dataset = dataset
+        self.batch_size = batch_size  # 每卡的batch大小
+        self.k = k                    # 每个样本重复的次数
+        self.num_replicas = num_replicas  # 总卡数
+        self.rank = rank              # 当前卡编号
+        self.seed = seed              # 随机种子，用于同步
+        
+        # 计算每个迭代需要的不同样本数
+        self.total_samples = self.num_replicas * self.batch_size
+        assert self.total_samples % self.k == 0, f"k can not div n*b, k{k}-num_replicas{num_replicas}-batch_size{batch_size}"
+        self.m = self.total_samples // self.k  # 不同样本数
+        self.epoch=0
+
+    def __iter__(self):
+        while True:
+            # 生成确定性的随机序列，确保所有卡同步
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            # print('epoch', self.epoch)
+            # 随机选择m个不同的样本
+            indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()
+            # print(self.rank, 'indices', indices)
+            # 每个样本重复k次，生成总样本数n*b
+            repeated_indices = [idx for idx in indices for _ in range(self.k)]
+            
+            # 打乱顺序确保均匀分配
+            shuffled_indices = torch.randperm(len(repeated_indices), generator=g).tolist()
+            shuffled_samples = [repeated_indices[i] for i in shuffled_indices]
+            # print(self.rank, 'shuffled_samples', shuffled_samples)
+            # 将样本分割到各个卡
+            per_card_samples = []
+            for i in range(self.num_replicas):
+                start = i * self.batch_size
+                end = start + self.batch_size
+                per_card_samples.append(shuffled_samples[start:end])
+            # print(self.rank, 'per_card_samples', per_card_samples[self.rank])
+            # 返回当前卡的样本索引
+            yield per_card_samples[self.rank]
+    
+    def set_epoch(self, epoch):
+        self.epoch = epoch  # 用于同步不同 epoch 的随机状态
+
+def compute_text_embeddings(prompt, pipeline, max_sequence_length, device):
     """Compute text embeddings for Flux model"""
     with torch.no_grad():
         # For Flux, we need both CLIP and T5 embeddings
-        prompt_embeds, pooled_prompt_embeds, text_ids = text_encoders[0].encode_prompt(
+        prompt_embeds, pooled_prompt_embeds, text_ids = pipeline.encode_prompt(
             prompt=prompt,
             prompt_2=prompt,  # Use same prompt for both encoders
             device=device,
@@ -153,8 +234,10 @@ def main(_):
     )
     
     if accelerator.is_main_process:
+        # Initialize wandb with project name from config
+        wandb_project = getattr(config, 'wandb_project', 'flux-grpo-run')
         accelerator.init_trackers(
-            project_name="flux-grpo",
+            project_name=wandb_project,
             config=config.to_dict(),
             init_kwargs={"wandb": {"name": config.run_name}},
         )
@@ -259,16 +342,15 @@ def main(_):
     )
 
     # Setup reward function
-    reward_fn = getattr(flux_grpo.rewards, 'multi_score')(
+    reward_fn = getattr(flow_grpo.rewards, 'multi_score')(
         accelerator.device, config.reward_fn
     )
-    eval_reward_fn = getattr(flux_grpo.rewards, 'multi_score')(
+    eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(
         accelerator.device, config.reward_fn
     )
 
     # Setup datasets and dataloaders
     if config.prompt_fn == "general_ocr":
-        from flux_grpo.datasets import TextPromptDataset, DistributedKRepeatSampler
         
         train_dataset = TextPromptDataset(config.dataset, 'train')
         test_dataset = TextPromptDataset(config.dataset, 'test')
@@ -301,7 +383,7 @@ def main(_):
 
     # Prepare negative prompt embeddings
     neg_prompt_embed, neg_pooled_prompt_embed, neg_text_ids = compute_text_embeddings(
-        [""], [pipeline], [], max_sequence_length=512, device=accelerator.device
+        [""], pipeline, max_sequence_length=512, device=accelerator.device
     )
 
     sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
@@ -367,7 +449,7 @@ def main(_):
 
             # Compute text embeddings for Flux
             prompt_embeds, pooled_prompt_embeds, text_ids = compute_text_embeddings(
-                prompts, [pipeline], [], max_sequence_length=512, device=accelerator.device
+                prompts, pipeline, max_sequence_length=512, device=accelerator.device
             )
             
             # For tokenizer compatibility
